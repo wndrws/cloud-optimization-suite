@@ -8,10 +8,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -188,35 +190,6 @@ func (registry *CloudTaskRegistry) GetStageByName(taskRunUUID, stageName string)
 
 	return &stage, nil
 }
-
-// This function is not needed any more as Stage got the "Next" field
-//
-//func (registry *CloudTaskRegistry) GetNextStage(stage *Stage) (*Stage, error) {
-//	input := &dynamodb.GetItemInput{
-//		TableName: aws.String(StagesTable),
-//		Key: map[string]types.AttributeValue{
-//			"run_uuid":  &types.AttributeValueMemberS{Value: stage.TaskRunUUID},
-//			"n_ord":     &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", stage.NOrd+1)},
-//		},
-//	}
-//
-//	result, err := registry.dynamodbClient.GetItem(context.TODO(), input)
-//	if err != nil {
-//		return nil, err
-//	}
-//
-//	if len(result.Item) == 0 {
-//		fmt.Printf("No next stage after %q in task %s\n", stage.Name, stage.TaskRunUUID)
-//		return nil, nil
-//	} else {
-//		var nextStage Stage
-//		err = attributevalue.UnmarshalMap(result.Item, &nextStage)
-//		if err != nil {
-//			return nil, err
-//		}
-//		return &nextStage, nil
-//	}
-//}
 
 func (registry *CloudTaskRegistry) GetAllStages(taskRunUUID string) ([]Stage, error) {
 	result, err := registry.dynamodbClient.Query(context.TODO(), &dynamodb.QueryInput{
@@ -396,7 +369,7 @@ func (registry *CloudTaskRegistry) UploadFileForTask(filePath, s3Bucket, taskId,
 	}
 	defer file.Close()
 
-	s3Path := fmt.Sprintf("%s/%s/%s/%s", s3CommonPrefix, taskId, taskRunId, filepath.Base(filePath))
+	s3Path := strings.Join([]string{s3CommonPrefix, taskId, taskRunId, filepath.Base(filePath)}, "/")
 	_, err = registry.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(s3Bucket),
 		Key:    aws.String(s3Path),
@@ -410,17 +383,38 @@ func (registry *CloudTaskRegistry) UploadFileForTask(filePath, s3Bucket, taskId,
 	return s3Path, nil
 }
 
-func (registry *CloudTaskRegistry) UploadFileForStage(filePath, s3Bucket string, taskRun *TaskRun, stageName string, stageNOrd int) (string, error) {
+func (registry *CloudTaskRegistry) UploadFileForStage(
+	filePath string,
+	s3Bucket string,
+	taskRun *TaskRun,
+	stageName string,
+	stageNOrd int,
+) (string, error) {
 	// By default, we use Standard storage class
-	return registry.uploadFileForStage(filePath, s3Bucket, taskRun, stageName, stageNOrd, "STANDARD")
+	return registry.uploadFileForStage(
+		filePath, s3Bucket, taskRun, stageName, stageNOrd, s3types.StorageClassStandard)
 }
 
-func (registry *CloudTaskRegistry) UploadExtraFileForStage(filePath, s3Bucket string, taskRun *TaskRun, stageName string, stageNOrd int) (string, error) {
+func (registry *CloudTaskRegistry) UploadExtraFileForStage(
+	filePath string,
+	s3Bucket string,
+	taskRun *TaskRun,
+	stageName string,
+	stageNOrd int,
+) (string, error) {
 	// Cold storage is 2x cheaper, so let's use it for extra artifacts that stages may have
-	return registry.uploadFileForStage(filePath, s3Bucket, taskRun, stageName, stageNOrd, "STANDARD_IA")
+	return registry.uploadFileForStage(
+		filePath, s3Bucket, taskRun, stageName, stageNOrd, s3types.StorageClassStandardIa)
 }
 
-func (registry *CloudTaskRegistry) uploadFileForStage(filePath, s3Bucket string, taskRun *TaskRun, stageName string, stageNOrd int, storageClass string) (string, error) {
+func (registry *CloudTaskRegistry) uploadFileForStage(
+	filePath string,
+	s3Bucket string,
+	taskRun *TaskRun,
+	stageName string,
+	stageNOrd int,
+	storageClass s3types.StorageClass,
+) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -428,11 +422,14 @@ func (registry *CloudTaskRegistry) uploadFileForStage(filePath, s3Bucket string,
 	defer file.Close()
 
 	stageFolder := fmt.Sprintf("%d_%s", stageNOrd, stageName)
-	s3Path := fmt.Sprintf("%s/%s/%s/%s/%s", s3CommonPrefix, taskRun.TaskID, taskRun.UUID, stageFolder, filepath.Base(filePath))
+	s3Path := strings.Join(
+		[]string{s3CommonPrefix, taskRun.TaskID, taskRun.UUID, stageFolder, filepath.Base(filePath)},
+		"/")
 	_, err = registry.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(s3Bucket),
-		Key:    aws.String(s3Path),
-		Body:   file,
+		Bucket:       aws.String(s3Bucket),
+		Key:          aws.String(s3Path),
+		Body:         file,
+		StorageClass: storageClass,
 	})
 	if err != nil {
 		return "", err
