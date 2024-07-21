@@ -1,0 +1,12 @@
+- name: blade-generation
+  config: /home/z003sk2s/non-job/blade-pipeline/shared/beziergan_model_generator_config.yaml
+  next: [blade-postprocess]
+- name: blade-postprocess
+  config: /home/z003sk2s/non-job/blade-pipeline/shared/blender_repair_blade_config.yaml
+  next: [cfd]
+- name: cfd
+#  executor: serverless container 23456fg; OpenFoam 23.12
+  next: [cfd-reader]
+- name: cfd-reader
+#  config: /path/4
+  next: []
