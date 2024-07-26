@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -17,6 +18,9 @@ func startCommandAndWait(
 	stage *cloud_task_registry.Stage,
 	envVars map[string]string,
 ) *AppError {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	command, errReadCmdFile := os.ReadFile(commandFilePath) // TODO support direct command instead of a file?
 	if errReadCmdFile != nil {
 		msg := "unable to read command file"
@@ -37,6 +41,7 @@ func startCommandAndWait(
 	cmd.Env = nil // append(cmd.Env, env...) // TODO Does this work?
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	go launchTaskCancellationListener(ctx, cmd, stage)
 	if err := cmd.Start(); err != nil {
 		msg := fmt.Sprintf("unable to start shell subprocess %q", string(command))
 		return &AppError{err, msg, http.StatusInternalServerError, stage}
@@ -45,11 +50,15 @@ func startCommandAndWait(
 	go monitorSubprocess(cmd)
 
 	if err := cmd.Wait(); err != nil || cmd.ProcessState.ExitCode() != 0 {
-		if err == nil {
-			err = errors.New("non-zero exit code from subprocess")
+		if taskWasCancelled, _ := taskRegistry.IsCancelled(stage.TaskRunUUID); taskWasCancelled {
+			log.Println("Subprocess was interrupted and finished with exit-code", cmd.ProcessState.ExitCode())
+		} else {
+			if err == nil {
+				err = errors.New("non-zero exit code from subprocess")
+			}
+			msg := fmt.Sprintf("subprocess failed with error, exit-code %d", cmd.ProcessState.ExitCode())
+			return &AppError{err, msg, http.StatusInternalServerError, stage}
 		}
-		msg := fmt.Sprintf("subprocess failed with error, exit-code %d", cmd.ProcessState.ExitCode())
-		return &AppError{err, msg, http.StatusInternalServerError, stage}
 	}
 	return nil
 }
@@ -62,5 +71,26 @@ func monitorSubprocess(cmd *exec.Cmd) {
 		}
 		log.Println("Subprocess is still running")
 		time.Sleep(5 * time.Second)
+	}
+}
+
+func launchTaskCancellationListener(ctx context.Context, cmd *exec.Cmd, stage *cloud_task_registry.Stage) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			taskCancelled, err := taskRegistry.IsCancelled(stage.TaskRunUUID)
+			if err != nil {
+				log.Println("Couldn't check the task run cancellation (will retry in 5s):", err)
+			}
+			if taskCancelled {
+				err = cmd.Process.Signal(syscall.SIGTERM)
+				if err != nil {
+					log.Println("Couldn't send SIGTERM to the job (will retry in 5s):", err)
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
 	}
 }

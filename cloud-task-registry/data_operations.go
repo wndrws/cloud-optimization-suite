@@ -47,6 +47,34 @@ func (registry *CloudTaskRegistry) InsertStage(stage Stage) error {
 	return err
 }
 
+// UpdateTaskRunStatus NB: The status will be updated unless the task run is already cancelled
+func (registry *CloudTaskRegistry) UpdateTaskRunStatus(taskRun *TaskRun, newStatus TaskRunStatus) error {
+	input := &dynamodb.UpdateItemInput{
+		TableName: aws.String(TasksTable),
+		Key: map[string]types.AttributeValue{
+			"task_id":  &types.AttributeValueMemberS{Value: taskRun.TaskID},
+			"run_uuid": &types.AttributeValueMemberS{Value: taskRun.UUID},
+		},
+		UpdateExpression:    aws.String("SET #status = :newStatus"),
+		ConditionExpression: aws.String("attribute_exists(run_uuid) AND #status <> :cancelled"),
+		ExpressionAttributeNames: map[string]string{
+			"#status": "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":newStatus": &types.AttributeValueMemberS{Value: string(newStatus)},
+			":cancelled": &types.AttributeValueMemberS{Value: string(TaskRunStatus_Cancelled)},
+		},
+		ReturnValues: types.ReturnValueUpdatedNew,
+	}
+
+	_, err := registry.dynamodbClient.UpdateItem(context.TODO(), input)
+	if err != nil {
+		return fmt.Errorf("failed to update task run status: %w", err)
+	}
+
+	return nil
+}
+
 // TODO make this work, as well
 //func (registry *CloudTaskRegistry) GetTask(taskId string) (*TaskRun, error) {
 //	input := &dynamodb.GetItemInput{
@@ -99,6 +127,17 @@ func (registry *CloudTaskRegistry) GetTaskRun(taskRunUUID string) (*TaskRun, err
 	}
 
 	return &task, nil
+}
+
+func (registry *CloudTaskRegistry) IsCancelled(taskRunUUID string) (bool, error) {
+	taskRun, err := registry.GetTaskRun(taskRunUUID)
+	if err != nil {
+		return false, err
+	}
+	if taskRun != nil && taskRun.Status == TaskRunStatus_Cancelled {
+		return true, nil
+	}
+	return false, nil
 }
 
 // PutTaskRunResults TODO support append?

@@ -9,6 +9,7 @@ type TaskRun struct {
 	Results        map[string]string `dynamodbav:"results,omitempty"`
 	TaskDefinition string            `dynamodbav:"task_definition"`
 	CreationTime   *time.Time        `dynamodbav:"creation_time,omitempty"`
+	Status         TaskRunStatus     `dynamodbav:"status"`
 }
 
 type Stage struct {
@@ -27,7 +28,9 @@ type Stage struct {
 	Next        []string   `dynamodbav:"next,omitempty"` // name(s) of stage(s) to execute next
 }
 
-// очереди в SQS создавать по именам stage'ей, которым предназначены сообщения в очередях
+const TasksTable = "task_runs"
+
+const StagesTable = "task_stages"
 
 const (
 	StageStatus_Pending    = "Pending"
@@ -39,5 +42,11 @@ const (
 
 const StageInitialStatus = StageStatus_Pending
 
-const TasksTable = "task_runs"
-const StagesTable = "task_stages"
+type TaskRunStatus string
+
+const (
+	TaskRunStatus_Submitted TaskRunStatus = "Submitted"
+	TaskRunStatus_Finished  TaskRunStatus = "Finished"
+	TaskRunStatus_Failed    TaskRunStatus = "Failed"
+	TaskRunStatus_Cancelled TaskRunStatus = "Cancelled"
+)

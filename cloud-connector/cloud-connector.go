@@ -99,10 +99,19 @@ func handler(
 		return &AppError{errGetStage, msg, http.StatusInternalServerError, stage}
 	}
 
-	task, errGetTask := taskRegistry.GetTaskRun(stage.TaskRunUUID)
+	taskRun, errGetTask := taskRegistry.GetTaskRun(stage.TaskRunUUID)
 	if errGetTask != nil {
-		msg := fmt.Sprintf("couldn't get task %s from the task registry", stage.TaskRunUUID)
+		msg := fmt.Sprintf("couldn't get task run %s from the task registry", stage.TaskRunUUID)
 		return &AppError{errGetTask, msg, http.StatusInternalServerError, stage}
+	}
+
+	taskWasCancelled, err := taskRegistry.IsCancelled(taskRun.UUID)
+	if taskWasCancelled {
+		markAsCancelled(stage)
+		return nil
+	}
+	if err != nil {
+		log.Println("Couldn't check if task run is cancelled. Assuming it is not... The error was", err)
 	}
 
 	if err := startStage(stage); err != nil {
@@ -117,30 +126,48 @@ func handler(
 		return err
 	}
 
-	if err := startCommandAndWait(commandFilePath, stage, task.Parameters); err != nil {
+	if err := startCommandAndWait(commandFilePath, stage, taskRun.Parameters); err != nil {
 		return err
 	}
 
-	s3PathForOutput, appErr := uploadOutputFile(outputFilePath, task, stage)
-	if appErr != nil {
-		return appErr
-	}
+	if taskWasCancelled, _ := taskRegistry.IsCancelled(taskRun.UUID); taskWasCancelled {
+		log.Println("Setting cancellation status to the stage", stage.Name, "for task run", stage.TaskRunUUID)
+		err := taskRegistry.UpdateStageStatus(stage, cloud_task_registry.StageStatus_Cancelled)
+		if err != nil {
+			log.Println("Unable to update status for stage", stage.Name, "for task run",
+				stage.TaskRunUUID, "(non-critical error)", err)
+		}
+	} else {
+		s3PathForOutput, appErr := uploadOutputFile(outputFilePath, taskRun, stage)
+		if appErr != nil {
+			return appErr
+		}
 
-	if err := handoverTask(stage, task, s3PathForOutput, outputFilePath); err != nil {
-		return err
-	}
+		if err := handoverTask(stage, taskRun, s3PathForOutput, outputFilePath); err != nil {
+			return err
+		}
 
-	if err := finishStage(stage, task); err != nil {
-		return err
-	}
+		if err := finishStage(stage, taskRun); err != nil {
+			return err
+		}
 
-	if len(extraArtifactsPaths) > 0 && extraArtifactsPaths[0] != "" {
-		uploadExtraArtifactsAndUpdateStageComment(extraArtifactsPaths, task, stage)
+		if len(extraArtifactsPaths) > 0 && extraArtifactsPaths[0] != "" {
+			uploadExtraArtifactsAndUpdateStageComment(extraArtifactsPaths, taskRun, stage)
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Success"))
 	return nil
+}
+
+func markAsCancelled(stage *cloud_task_registry.Stage) {
+	log.Println("Setting cancelled status to the stage", stage.Name, "for task run", stage.TaskRunUUID)
+	err := taskRegistry.UpdateStageStatus(stage, cloud_task_registry.StageStatus_Cancelled)
+	if err != nil {
+		log.Println("Unable to update status for stage", stage.Name, "for task run",
+			stage.TaskRunUUID, "(non-critical error)", err)
+	}
 }
 
 func startStage(stage *cloud_task_registry.Stage) *AppError {

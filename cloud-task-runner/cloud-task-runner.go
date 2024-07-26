@@ -7,6 +7,8 @@ import (
 	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -77,6 +79,7 @@ func main() {
 		Results:        nil,
 		TaskDefinition: s3Path,
 		CreationTime:   &taskCreationTime,
+		Status:         cloud_task_registry.TaskRunStatus_Submitted,
 	}
 
 	stages, err := createStages(registry, &taskRun, *stagesConfigPath, *s3Bucket)
@@ -99,26 +102,34 @@ func main() {
 
 	err = registry.PassTaskToStage(&stages[0])
 	if err != nil {
+		_ = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Failed)
 		log.Fatalf("failed starting the pipeline: %v", err)
 	}
 	log.Println("Submitted task run", newRunUUID.String(), "for task", *taskId)
 
-	// TODO we should wait not only on finished-tasks but also check cancelled-tasks and failed ones
-	finishedTaskRunID, err := registry.WaitForPipelineFinish(*taskId, newRunUUID.String())
-	if err != nil {
-		log.Fatalf("failed while waiting for the pipeline to finish: %v", err)
-	}
-	if finishedTaskRunID != taskRun.UUID {
-		log.Fatalf("pipeline returned %s as finished task run but expected %s\n", finishedTaskRunID, taskRun.UUID)
-	}
-	log.Println("Pipeline finished successfully!")
+	// TODO we should wait not only on finished-tasks but also check failed ones
 
-	finishedTask, err := registry.GetTaskRun(finishedTaskRunID)
+	wasCancelled := make(chan bool, 3)
+	setupCancellationHandler(registry, &taskRun, wasCancelled)
+	finishedTaskRunID, err := registry.WaitForPipelineFinish(*taskId, newRunUUID.String(), wasCancelled)
+	if taskCancelled := <-wasCancelled; !taskCancelled {
+		if err != nil {
+			log.Fatalf("failed while waiting for the pipeline to finish: %v", err)
+		}
+		if finishedTaskRunID != taskRun.UUID {
+			log.Fatalf("pipeline returned %s as finished task run but expected %s\n", finishedTaskRunID, taskRun.UUID)
+		}
+		log.Println("Pipeline finished successfully!")
+	} else {
+		log.Println("Task execution cancelled!")
+	}
+
+	finishedTask, err := registry.GetTaskRun(taskRun.UUID)
 	if err != nil {
 		log.Fatalf("failed getting task run information from DB: %v", err)
 	}
 
-	finishedStages, err := registry.GetAllStages(finishedTaskRunID)
+	finishedStages, err := registry.GetAllStages(taskRun.UUID)
 	if err != nil {
 		log.Fatalf("failed getting stages information from DB: %v", err)
 	}
@@ -131,8 +142,20 @@ func main() {
 			log.Fatalf("failed printing results into the output file: %v", err)
 		}
 		fmt.Println("Written output to", *outputFile)
+		err = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Finished)
+		if err != nil {
+			log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Finished,
+				"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
+		}
 		os.Exit(0)
 	} else {
+		if anyStageHasStatus(finishedStages, cloud_task_registry.StageStatus_Error) {
+			err = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Failed)
+			if err != nil {
+				log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Failed,
+					"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
+			}
+		}
 		os.Exit(-1)
 	}
 }
@@ -141,7 +164,7 @@ func checkRequiredFlags(
 	dynamoDocApiEndpoint *string,
 	s3Bucket *string,
 	stagesConfigPath *string,
-	taskName *string,
+	taskId *string,
 	taskDefinitionPath *string,
 	runParametersFilePath *string,
 	outputFile *string,
@@ -155,8 +178,8 @@ func checkRequiredFlags(
 	if *stagesConfigPath == "" {
 		log.Fatal("Please provide --stages-config-file")
 	}
-	if *taskName == "" {
-		log.Fatal("Please provide --task-name")
+	if *taskId == "" {
+		log.Fatal("Please provide --task-id")
 	}
 	if *taskDefinitionPath == "" {
 		log.Fatal("Please provide --task-definition-file")
@@ -190,4 +213,23 @@ func printMapToFile(filename string, m map[string]string) error {
 	}
 
 	return nil
+}
+
+func setupCancellationHandler(
+	registry *cloud_task_registry.CloudTaskRegistry,
+	taskRun *cloud_task_registry.TaskRun,
+	wasCancelled chan bool,
+) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		log.Println("Got interrupt, cancelling the task...")
+		err := registry.UpdateTaskRunStatus(taskRun, cloud_task_registry.TaskRunStatus_Cancelled)
+		if err != nil {
+			log.Println("Failed to cancel task:", err)
+		} else {
+			wasCancelled <- true
+		}
+	}()
 }

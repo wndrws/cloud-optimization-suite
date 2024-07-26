@@ -6,7 +6,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -52,7 +55,24 @@ func getQueueUrl(queueName string, svc *sqs.Client) (string, error) {
 	return *result.QueueUrl, nil
 }
 
-func (registry *CloudTaskRegistry) WaitForPipelineFinish(taskId, expectedTaskRunUUID string) (string, error) {
+func (registry *CloudTaskRegistry) WaitForPipelineFinish(
+	taskId string,
+	expectedTaskRunUUID string,
+	wasCancelled chan bool,
+) (string, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		wasCancelled <- true
+		cancel()
+	}()
+	defer func() {
+		wasCancelled <- false
+	}()
+
 	queueURL, err := getQueueUrl(finishedTasksQ, registry.sqsClient)
 	if err != nil {
 		return "", fmt.Errorf("error getting SQS queue URL for name %q, %w", finishedTasksQ, err)
@@ -60,7 +80,7 @@ func (registry *CloudTaskRegistry) WaitForPipelineFinish(taskId, expectedTaskRun
 	log.Println("Waiting for the pipeline to finish...")
 	for {
 		// Receive messages with long polling
-		output, err := registry.sqsClient.ReceiveMessage(context.TODO(), &sqs.ReceiveMessageInput{
+		output, err := registry.sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(queueURL),
 			MaxNumberOfMessages: 1,
 			WaitTimeSeconds:     20, // Long polling timeout (maximum 20 seconds)
@@ -71,8 +91,6 @@ func (registry *CloudTaskRegistry) WaitForPipelineFinish(taskId, expectedTaskRun
 
 		if len(output.Messages) == 0 {
 			registry.printStatusReport(taskId, expectedTaskRunUUID)
-			// Sleep for a short duration before polling again
-			time.Sleep(5 * time.Second)
 			continue
 		}
 
@@ -86,8 +104,12 @@ func (registry *CloudTaskRegistry) WaitForPipelineFinish(taskId, expectedTaskRun
 			log.Printf("Pipeline returned %s as finished task but expected %s, keep waiting...\n",
 				*finishedTaskRunUUID, expectedTaskRunUUID)
 			registry.printStatusReport(taskId, expectedTaskRunUUID)
-			time.Sleep(20 * time.Second)
-			continue
+			interrupted := SleepInterruptibly(ctx, 20*time.Second)
+			if interrupted {
+				return expectedTaskRunUUID, nil
+			} else {
+				continue
+			}
 		} else {
 			log.Println("TaskRun", *finishedTaskRunUUID, "finished!")
 			_, err = registry.sqsClient.DeleteMessage(context.TODO(), &sqs.DeleteMessageInput{
@@ -121,4 +143,15 @@ func (registry *CloudTaskRegistry) getStagesStatusReport(taskRunUUID string) (st
 		stagesStatuses[i] = fmt.Sprintf("%s - %s", stage.Name, stage.Status)
 	}
 	return strings.Join(stagesStatuses, ", "), nil
+}
+
+func SleepInterruptibly(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	select {
+	case <-ctx.Done():
+		t.Stop()
+		return true
+	case <-t.C:
+	}
+	return false
 }
