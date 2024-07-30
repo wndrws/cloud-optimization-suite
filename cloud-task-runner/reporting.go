@@ -10,6 +10,7 @@ func printTaskReportWithAllStages(task *cloud_task_registry.TaskRun, stages []cl
 	fmt.Printf("Finished task run:\n")
 	fmt.Printf("  UUID: %s\n", task.UUID)
 	fmt.Printf("  Parameters: %v\n", task.Parameters)
+	fmt.Printf("  Status: %s\n\n", task.Status)
 	fmt.Printf("  Results: %v\n", task.Results)
 	fmt.Printf("  Task Definition: %s\n\n", "[not shown here]")
 
