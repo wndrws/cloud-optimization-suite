@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -22,6 +23,9 @@ type AppError struct {
 var taskRegistry *cloud_task_registry.CloudTaskRegistry
 
 func main() {
+	if os.Getenv("SHOW_CPU_INFO") != "" {
+		logCpuInformation()
+	}
 	port := os.Getenv("PORT")
 	if port == "" {
 		log.Fatal("PORT environment variable not set")
@@ -241,4 +245,14 @@ func handoverTask(
 		}
 	}
 	return nil
+}
+
+func logCpuInformation() {
+	cmd := exec.Command("lscpu")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		log.Println("Failed to call lscpu due to error:", err)
+	}
 }
