@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"github.com/google/uuid"
@@ -11,6 +12,8 @@ import (
 	"syscall"
 	"time"
 )
+
+const pidsFile = "cloud-task-runner.pids"
 
 func main() {
 	dynamoDocApiEndpoint :=
@@ -31,6 +34,8 @@ func main() {
 	flag.Parse()
 
 	checkRequiredFlags(dynamoDocApiEndpoint, s3Bucket, stagesConfigPath, taskId, taskDefinitionPath, runParametersFilePath, outputFile)
+
+	dumpProcessId()
 
 	newRunUUID, err := uuid.NewV7()
 	if err != nil {
@@ -158,6 +163,30 @@ func main() {
 		}
 		os.Exit(-1)
 	}
+}
+
+func dumpProcessId() {
+	pid := os.Getpid()
+	f, err := os.OpenFile(pidsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			log.Fatalf("Could not close file %q: %v", pidsFile, err)
+		}
+	}(f)
+	if err != nil {
+		log.Fatalf("Couldn't open %q: %v", pidsFile, err)
+	}
+	w := bufio.NewWriter(f)
+	_, err = w.WriteString(fmt.Sprintf("%d ", pid))
+	if err != nil {
+		log.Fatalf("Couldn't write PID to file %q: %v", pidsFile, err)
+	}
+	err = w.Flush()
+	if err != nil {
+		log.Fatalf("Couldn't flush PID to file %q: %v", pidsFile, err)
+	}
+	log.Println("The cloud task runner's PID", pid, "appended to", pidsFile)
 }
 
 func checkRequiredFlags(
