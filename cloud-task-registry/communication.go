@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,6 +15,8 @@ import (
 )
 
 const finishedTasksQ = "finished-tasks"
+
+const longPollingInterval = 20 // seconds
 
 func (registry *CloudTaskRegistry) FinishTaskRun(taskRunUUID string) error {
 	err := sendMessageToSQS(finishedTasksQ, taskRunUUID, registry.sqsClient)
@@ -83,7 +86,7 @@ func (registry *CloudTaskRegistry) WaitForPipelineFinish(
 		output, err := registry.sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(queueURL),
 			MaxNumberOfMessages: 1,
-			WaitTimeSeconds:     20, // Long polling timeout (maximum 20 seconds)
+			WaitTimeSeconds:     longPollingInterval,
 		})
 		if err != nil {
 			return "", fmt.Errorf("failed to receive messages, %w", err)
@@ -103,8 +106,14 @@ func (registry *CloudTaskRegistry) WaitForPipelineFinish(
 		if *finishedTaskRunUUID != expectedTaskRunUUID {
 			log.Printf("Pipeline returned %s as finished task but expected %s, keep waiting...\n",
 				*finishedTaskRunUUID, expectedTaskRunUUID)
+			err := makeMessageMaximallyVisible(finishedTasksQ, *output.Messages[0].ReceiptHandle, registry.sqsClient)
+			if err != nil {
+				log.Printf("Failed to set message visibility timeout to 0 due to an error: %v\n", err)
+				log.Println("You can try sending SIGSTOP and SIGCONT to one of the task runners " +
+					"to break the tie between them if this is the case.")
+			}
 			registry.printStatusReport(taskId, expectedTaskRunUUID)
-			interrupted := SleepInterruptibly(ctx, 20*time.Second)
+			interrupted := SleepInterruptibly(ctx, time.Duration(rand.Intn(3000))*time.Millisecond)
 			if interrupted {
 				return expectedTaskRunUUID, nil
 			} else {
@@ -154,4 +163,23 @@ func SleepInterruptibly(ctx context.Context, d time.Duration) bool {
 	case <-t.C:
 	}
 	return false
+}
+
+func makeMessageMaximallyVisible(queueName, receiptHandle string, svc *sqs.Client) error {
+	queueUrl, err := getQueueUrl(queueName, svc)
+	if err != nil {
+		return fmt.Errorf("error getting SQS queue URL for name %q, %w", queueName, err)
+	}
+
+	input := &sqs.ChangeMessageVisibilityInput{
+		QueueUrl:          aws.String(queueUrl),
+		ReceiptHandle:     aws.String(receiptHandle),
+		VisibilityTimeout: 0,
+	}
+
+	_, err = svc.ChangeMessageVisibility(context.TODO(), input)
+	if err != nil {
+		return fmt.Errorf("failed to change message visibility: %w", err)
+	}
+	return nil
 }
