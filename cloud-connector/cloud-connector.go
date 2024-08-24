@@ -38,6 +38,9 @@ func main() {
 	commandFilePath := flag.String("command-file-path", "/tmp/run-command.sh", "Path to the command file (internal)")
 	dynamoDocApiEndpoint := flag.String("dynamo-docapi-endpoint", "", "DynamoDB Document API endpoint URL for task registry")
 	extraArtifacts := flag.String("extra-artifacts", "", "Comma-delimited paths to extra artifacts (files and/or folders) to upload to S3")
+	maxTimeForExtrasArchiving := flag.Int("max-archiving-time", 90, "Max time that is expected to be spent on archiving extra artifacts")
+	timeout := flag.Int("timeout", 600, "Request processing timeout (in seconds) that is imposed by the cloud execution environment")
+	// If there is less than [maxTimeForExtrasArchiving] seconds before [timout], extra artifacts will not be compressed and uploaded to S3
 
 	flag.Parse()
 
@@ -62,7 +65,9 @@ func main() {
 	extraArtifactsPaths := strings.Split(*extraArtifacts, ",")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		appErr := handler(w, r, *pipelineStage, *configFilePath, *inputFilePath, *outputFilePath, *commandFilePath, extraArtifactsPaths)
+		timeoutRisk := false
+		timer := time.AfterFunc(time.Duration(*timeout-*maxTimeForExtrasArchiving)*time.Second, func() { timeoutRisk = true })
+		appErr := handler(w, r, *pipelineStage, *configFilePath, *inputFilePath, *outputFilePath, *commandFilePath, extraArtifactsPaths, &timeoutRisk)
 		if appErr != nil {
 			log.Printf("Error: %s (%v)", appErr.Message, appErr.Error)
 			http.Error(w, appErr.Message, appErr.Code)
@@ -73,6 +78,7 @@ func main() {
 				}
 			}
 		}
+		timer.Stop()
 	})
 
 	log.Println("Starting server on port", port)
@@ -86,6 +92,7 @@ func handler(
 	r *http.Request,
 	pipelineStage, configPath, inputFilePath, outputFilePath, commandFilePath string,
 	extraArtifactsPaths []string,
+	timeoutRisk *bool,
 ) *AppError {
 	taskId, appErr := extractSQSMessageBodyFromYandexCloudTriggerRequest(r)
 	if appErr != nil {
@@ -156,7 +163,11 @@ func handler(
 		}
 
 		if len(extraArtifactsPaths) > 0 && extraArtifactsPaths[0] != "" {
-			uploadExtraArtifactsAndUpdateStageComment(extraArtifactsPaths, taskRun, stage)
+			if !*timeoutRisk {
+				uploadExtraArtifactsAndUpdateStageComment(extraArtifactsPaths, taskRun, stage)
+			} else {
+				log.Println("Extra artifacts will not be uploaded due to timeout risk!")
+			}
 		}
 	}
 
@@ -211,6 +222,12 @@ func handoverTask(
 			if errGetNextStage != nil {
 				msg := "error getting next stage"
 				return &AppError{errGetNextStage, msg, http.StatusInternalServerError, stage}
+			}
+			if nextStage.Status != cloud_task_registry.StageStatus_Pending {
+				log.Println("The next stage", nextStage.Name, "is not pending! This probably "+
+					"means that this stage was interrupted by timeout after it passed the task to "+
+					"the next one(s). To avoid task duplication in SQS, the connector will not "+
+					"pass it further. Task run ID was", taskRun.UUID, "for task", taskRun.TaskID)
 			}
 			if s3PathForOutput != "" {
 				if err := taskRegistry.UpdateStageInput(nextStage, s3PathForOutput); err != nil {
