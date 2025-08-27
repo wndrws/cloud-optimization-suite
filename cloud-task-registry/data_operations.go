@@ -3,18 +3,19 @@ package cloud_task_registry
 import (
 	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 func (registry *CloudTaskRegistry) InsertTaskRun(task TaskRun) error {
@@ -520,4 +521,86 @@ func (registry *CloudTaskRegistry) DownloadFileFromS3(s3Bucket, s3Path, destinat
 	absPath, _ := filepath.Abs(destination)
 	log.Printf("Successfully downloaded %q from S3 bucket %q to %q", s3Path, s3Bucket, absPath)
 	return nil
+}
+
+// ListTaskRuns queries by TaskID (partition key). Optional status filter.
+// If taskID == "", it falls back to a full table Scan (paginated).
+func (r *CloudTaskRegistry) ListTaskRuns(taskID string, statuses []TaskRunStatus) ([]TaskRun, error) {
+	var items []map[string]types.AttributeValue
+	var err error
+
+	if strings.TrimSpace(taskID) != "" {
+		items, err = r.queryTaskRunsByTaskID(context.TODO(), taskID)
+	} else {
+		items, err = r.scanAllTaskRuns(context.TODO())
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var res []TaskRun
+	if err := attributevalue.UnmarshalListOfMaps(items, &res); err != nil {
+		return nil, fmt.Errorf("unmarshal task runs: %w", err)
+	}
+
+	if len(statuses) == 0 {
+		return res, nil
+	}
+	allowed := map[TaskRunStatus]struct{}{}
+	for _, s := range statuses {
+		allowed[s] = struct{}{}
+	}
+	out := res[:0]
+	for _, tr := range res {
+		if _, ok := allowed[tr.Status]; ok {
+			out = append(out, tr)
+		}
+	}
+	return out, nil
+}
+
+func (r *CloudTaskRegistry) queryTaskRunsByTaskID(ctx context.Context, taskID string) ([]map[string]types.AttributeValue, error) {
+	var last map[string]types.AttributeValue
+	var items []map[string]types.AttributeValue
+
+	for {
+		resp, err := r.dynamodbClient.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(TasksTable),
+			KeyConditionExpression: aws.String("task_id = :tid"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":tid": &types.AttributeValueMemberS{Value: taskID},
+			},
+			ExclusiveStartKey: last,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("query task_runs by task_id: %w", err)
+		}
+		items = append(items, resp.Items...)
+		if len(resp.LastEvaluatedKey) == 0 {
+			break
+		}
+		last = resp.LastEvaluatedKey
+	}
+	return items, nil
+}
+
+func (r *CloudTaskRegistry) scanAllTaskRuns(ctx context.Context) ([]map[string]types.AttributeValue, error) {
+	var last map[string]types.AttributeValue
+	var items []map[string]types.AttributeValue
+
+	for {
+		resp, err := r.dynamodbClient.Scan(ctx, &dynamodb.ScanInput{
+			TableName:         aws.String(TasksTable),
+			ExclusiveStartKey: last,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("scan task_runs: %w", err)
+		}
+		items = append(items, resp.Items...)
+		if len(resp.LastEvaluatedKey) == 0 {
+			break
+		}
+		last = resp.LastEvaluatedKey
+	}
+	return items, nil
 }
