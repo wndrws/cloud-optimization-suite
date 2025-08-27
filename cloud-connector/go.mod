@@ -1,6 +1,6 @@
 module cloud-connector
 
-go 1.22
+go 1.24
 
 replace github.com/wndrws/cloud-optimization-suite/cloud-task-registry => ../cloud-task-registry
 
