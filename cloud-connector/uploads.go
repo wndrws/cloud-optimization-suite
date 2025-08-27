@@ -2,12 +2,13 @@ package main
 
 import (
 	"fmt"
-	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
+
+	cloud_task_registry "github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 )
 
 func uploadOutputFile(
@@ -16,10 +17,37 @@ func uploadOutputFile(
 	stage *cloud_task_registry.Stage,
 ) (string, *AppError) {
 	if outputFilePath != "" {
-		s3PathForOutput, err := taskRegistry.UploadFileForStage(
-			outputFilePath, stage.S3Bucket, task, stage.Name, stage.NOrd)
+		fileToUpload := outputFilePath
+		fileInfo, err := os.Stat(outputFilePath)
 		if err != nil {
-			msg := fmt.Sprintf("error uploading file %q to S3 bucket %q", outputFilePath, stage.S3Bucket)
+			msg := fmt.Sprintf("unable to stat path %q, %v", outputFilePath, err)
+			return "", &AppError{err, msg, http.StatusInternalServerError, stage}
+		}
+		if fileInfo.IsDir() {
+			archivePath := path.Join(os.TempDir(), stage.Name+"-output.7z")
+			defer func() {
+				if err := os.Remove(archivePath); err != nil {
+					fmt.Println("Couldn't remove the temporary file", archivePath, err)
+				} else {
+					fmt.Println("Cleaned up the archive:", archivePath)
+				}
+			}()
+			log.Printf("output artifact path %s points at a directory, archiving...", outputFilePath)
+			archiveCmd := exec.Command("7zz", "a", archivePath, outputFilePath)
+			archiveCmd.Stdout = os.Stdout
+			archiveCmd.Stderr = os.Stderr
+			errRun := archiveCmd.Run()
+			if errRun != nil {
+				err := fmt.Errorf("failed to compress directory %q, %w", outputFilePath, errRun)
+				return "", &AppError{err, err.Error(), http.StatusInternalServerError, stage}
+			}
+			fileToUpload = archivePath
+			log.Println("Successfully created archive:", archivePath)
+		}
+		s3PathForOutput, err := taskRegistry.UploadFileForStage(
+			fileToUpload, stage.S3Bucket, task, stage.Name, stage.NOrd)
+		if err != nil {
+			msg := fmt.Sprintf("error uploading file %q to S3 bucket %q", fileToUpload, stage.S3Bucket)
 			return "", &AppError{err, msg, http.StatusInternalServerError, stage}
 		}
 		if err := taskRegistry.UpdateStageOutput(stage, s3PathForOutput); err != nil {
