@@ -137,7 +137,12 @@ func handler(
 		return err
 	}
 
-	if err := startCommandAndWait(commandFilePath, stage, taskRun.Parameters); err != nil {
+	command, errReadCommandFile := readCommandFile(commandFilePath, stage)
+	if err != nil {
+		return errReadCommandFile
+	}
+
+	if err := startCommandAndWait(command, stage, taskRun.Parameters); err != nil {
 		return err
 	}
 
@@ -272,4 +277,13 @@ func logCpuInformation() {
 	if err != nil {
 		log.Println("Failed to call lscpu due to error:", err)
 	}
+}
+
+func readCommandFile(commandFilePath string, stage *cloud_task_registry.Stage) (string, *AppError) {
+	command, errReadCmdFile := os.ReadFile(commandFilePath)
+	if errReadCmdFile != nil {
+		msg := "unable to read command file"
+		return "", &AppError{errReadCmdFile, msg, http.StatusInternalServerError, stage}
+	}
+	return string(command), nil
 }

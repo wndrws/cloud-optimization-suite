@@ -4,28 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"syscall"
 	"time"
+
+	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 )
 
 func startCommandAndWait(
-	commandFilePath string,
+	command string,
 	stage *cloud_task_registry.Stage,
 	envVars map[string]string,
 ) *AppError {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	command, errReadCmdFile := os.ReadFile(commandFilePath) // TODO support direct command instead of a file?
-	if errReadCmdFile != nil {
-		msg := "unable to read command file"
-		return &AppError{errReadCmdFile, msg, http.StatusInternalServerError, stage}
-	}
 
 	// Create environment variables from the Parameters map
 	// env := []string{}
@@ -37,15 +32,16 @@ func startCommandAndWait(
 		}
 	}
 
-	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", string(command))
+	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", command)
 	cmd.Env = nil // append(cmd.Env, env...) // TODO Does this work?
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	go launchTaskCancellationListener(ctx, cmd, stage)
 	if err := cmd.Start(); err != nil {
-		msg := fmt.Sprintf("unable to start shell subprocess %q", string(command))
+		msg := fmt.Sprintf("unable to start shell subprocess %q", command)
 		return &AppError{err, msg, http.StatusInternalServerError, stage}
 	}
+	log.Println("Started subprocess", command)
 
 	go monitorSubprocess(cmd)
 
