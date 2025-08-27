@@ -4,13 +4,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 )
 
 type AppError struct {
@@ -129,6 +130,16 @@ func handler(
 		return err
 	}
 
+	if len(extraArtifactsPaths) > 0 && extraArtifactsPaths[0] != "" {
+		defer func() {
+			if !*timeoutRisk {
+				uploadExtraArtifactsAndUpdateStageComment(extraArtifactsPaths, taskRun, stage)
+			} else {
+				log.Println("Extra artifacts will not be uploaded due to timeout risk!")
+			}
+		}()
+	}
+
 	if err := downloadConfigFileIfSpecified(stage, configPath); err != nil {
 		return err
 	}
@@ -165,14 +176,6 @@ func handler(
 
 		if err := finishStage(stage, taskRun); err != nil {
 			return err
-		}
-
-		if len(extraArtifactsPaths) > 0 && extraArtifactsPaths[0] != "" {
-			if !*timeoutRisk {
-				uploadExtraArtifactsAndUpdateStageComment(extraArtifactsPaths, taskRun, stage)
-			} else {
-				log.Println("Extra artifacts will not be uploaded due to timeout risk!")
-			}
 		}
 	}
 
