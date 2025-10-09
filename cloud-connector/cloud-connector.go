@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
+	cloud_task_registry "github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 )
 
 type AppError struct {
@@ -115,6 +115,22 @@ func handler(
 	if errGetTask != nil {
 		msg := fmt.Sprintf("couldn't get task run %s from the task registry", stage.TaskRunUUID)
 		return &AppError{errGetTask, msg, http.StatusInternalServerError, stage}
+	}
+
+	if stage.Status == cloud_task_registry.StageStatus_Success {
+		log.Println("This stage has already finished with successful status! It means that task run "+
+			"duplication occurred in SQS - this should not happen in normal circumstances! "+
+			"Task run ID was", taskRun.UUID, "for task", taskRun.TaskID,
+			". Cloud Connector will do nothing.")
+		return nil
+	}
+
+	if stage.Status == cloud_task_registry.StageStatus_InProgress {
+		log.Println("This stage is already in progress! It means that task run "+
+			"duplication occurred in SQS - this should not happen in normal circumstances! "+
+			"Task run ID was", taskRun.UUID, "for task", taskRun.TaskID,
+			". Cloud Connector will do nothing.")
+		return nil
 	}
 
 	taskWasCancelled, err := taskRegistry.IsCancelled(taskRun.UUID)
