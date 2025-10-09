@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
+	cloud_task_registry "github.com/wndrws/cloud-optimization-suite/cloud-task-registry"
 )
 
 const pidsFile = "cloud-task-runner.pids"
@@ -30,10 +32,15 @@ func main() {
 		flag.String("parameters-file", "params.in", "File with optimization parameters for the task run, in 'k=v' per line format")
 	outputFile :=
 		flag.String("output-file", "", "File where to write the calculated objective function(s) value(s)")
+	dlqName :=
+		flag.String("dlq-name", "DLQ", "Name of the Dead Letter Queue to monitor for failed tasks")
+	objectivesArg :=
+		flag.String("objectives", "", "Comma-separated list of required objectives names (e.g. 'obj1,obj2')")
 
 	flag.Parse()
 
-	checkRequiredFlags(dynamoDocApiEndpoint, s3Bucket, stagesConfigPath, taskId, taskDefinitionPath, runParametersFilePath, outputFile)
+	checkRequiredFlags(dynamoDocApiEndpoint, s3Bucket, stagesConfigPath, taskId, taskDefinitionPath, runParametersFilePath, outputFile, objectivesArg)
+	objectives := parseObjectivesArg(*objectivesArg)
 
 	dumpProcessId()
 
@@ -112,21 +119,56 @@ func main() {
 	}
 	log.Println("Submitted task run", newRunUUID.String(), "for task", *taskId)
 
-	// TODO we should wait not only on finished-tasks but also check failed ones
-
 	wasCancelled := make(chan bool, 3)
 	setupCancellationHandler(registry, &taskRun, wasCancelled)
-	finishedTaskRunID, err := registry.WaitForPipelineFinish(*taskId, newRunUUID.String(), wasCancelled)
-	if taskCancelled := <-wasCancelled; !taskCancelled {
+
+	// Start waiting for both normal queue and DLQ
+	finishedTaskRunIDChan := make(chan string, 1)
+	dlqTaskRunIDChan := make(chan string, 1)
+	waitErrChan := make(chan error, 2)
+
+	go func() {
+		id, err := registry.WaitForPipelineFinish(*taskId, newRunUUID.String(), wasCancelled)
 		if err != nil {
-			log.Fatalf("failed while waiting for the pipeline to finish: %v", err)
+			waitErrChan <- err
+		} else {
+			finishedTaskRunIDChan <- id
 		}
+	}()
+
+	go func() {
+		id, err := registry.WaitForDLQ(*dlqName, newRunUUID.String(), wasCancelled)
+		if err != nil {
+			waitErrChan <- err
+		} else {
+			dlqTaskRunIDChan <- id
+		}
+	}()
+
+	cancelled := <-wasCancelled
+	if cancelled {
+		log.Println("Task execution cancelled!")
+		os.Exit(-1)
+	}
+
+	var finishedTaskRunID string
+	var dlqTriggered bool
+
+	select {
+	case err := <-waitErrChan:
+		log.Fatalf("failed while waiting for the pipeline to finish: %v", err)
+	case finishedTaskRunID = <-finishedTaskRunIDChan:
 		if finishedTaskRunID != taskRun.UUID {
 			log.Fatalf("pipeline returned %s as finished task run but expected %s\n", finishedTaskRunID, taskRun.UUID)
 		}
 		log.Println("Pipeline finished successfully!")
-	} else {
-		log.Println("Task execution cancelled!")
+	case dlqID := <-dlqTaskRunIDChan:
+		if dlqID == taskRun.UUID {
+			log.Println("Task run", dlqID, "was found in DLQ, marking as failed.")
+			dlqTriggered = true
+		} else {
+			log.Fatalf("DLQ returned %s as finished task run but expected %s\n", dlqID, taskRun.UUID)
+		}
 	}
 
 	finishedTask, err := registry.GetTaskRun(taskRun.UUID)
@@ -141,27 +183,52 @@ func main() {
 
 	printTaskReportWithAllStages(finishedTask, finishedStages)
 
-	if allStagesHaveStatus(finishedStages, cloud_task_registry.StageStatus_Success) {
-		err = printMapToFile(*outputFile, finishedTask.Results)
+	if dlqTriggered {
+		// Mark as failed and write -1 for missing objectives
+		if err := registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Failed); err != nil {
+			log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Failed,
+				"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
+		}
+		results := finishedTask.Results
+		if results == nil {
+			results = make(map[string]string)
+		}
+		for _, obj := range objectives {
+			if _, ok := results[obj]; !ok {
+				results[obj] = "NaN"
+			}
+		}
+		err = printMapToFile(*outputFile, results)
 		if err != nil {
 			log.Fatalf("failed printing results into the output file: %v", err)
 		}
 		fmt.Println("Written output to", *outputFile)
-		err = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Finished)
-		if err != nil {
-			log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Finished,
-				"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
-		}
 		os.Exit(0)
 	} else {
-		if anyStageHasStatus(finishedStages, cloud_task_registry.StageStatus_Error) {
-			err = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Failed)
+		if allStagesHaveStatus(finishedStages, cloud_task_registry.StageStatus_Success) {
+			err = printMapToFile(*outputFile, finishedTask.Results)
 			if err != nil {
-				log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Failed,
+				log.Fatalf("failed printing results into the output file: %v", err)
+			}
+			fmt.Println("Written output to", *outputFile)
+			err = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Finished)
+			if err != nil {
+				log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Finished,
 					"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
 			}
+			os.Exit(0)
+		} else {
+			// Unlikely situation: pipeline finished with erroneous stage(s) but via finished-tasks queue implying success
+			// TODO iterate over the result and put NaNs to the missing ones (?)
+			if anyStageHasStatus(finishedStages, cloud_task_registry.StageStatus_Error) {
+				err = registry.UpdateTaskRunStatus(&taskRun, cloud_task_registry.TaskRunStatus_Failed)
+				if err != nil {
+					log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Failed,
+						"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
+				}
+			}
+			os.Exit(-1)
 		}
-		os.Exit(-1)
 	}
 }
 
@@ -197,6 +264,7 @@ func checkRequiredFlags(
 	taskDefinitionPath *string,
 	runParametersFilePath *string,
 	outputFile *string,
+	objectivesList *string,
 ) {
 	if *dynamoDocApiEndpoint == "" {
 		log.Fatal("Please provide --dynamo-docapi-endpoint")
@@ -218,6 +286,9 @@ func checkRequiredFlags(
 	}
 	if *outputFile == "" {
 		log.Fatal("Please provide --output-file")
+	}
+	if *objectivesList == "" {
+		log.Fatal("Please provide --objectives (comma-separated list of required objectives names)")
 	}
 }
 
@@ -261,4 +332,30 @@ func setupCancellationHandler(
 			wasCancelled <- true
 		}
 	}()
+}
+
+func parseObjectivesArg(arg string) []string {
+	var objs []string
+	for _, obj := range splitAndTrim(arg, ",") {
+		if obj != "" {
+			objs = append(objs, obj)
+		}
+	}
+	return objs
+}
+
+func splitAndTrim(s, sep string) []string {
+	var res []string
+	for _, part := range split(s, sep) {
+		res = append(res, trim(part))
+	}
+	return res
+}
+
+func split(s, sep string) []string {
+	return strings.Split(s, sep)
+}
+
+func trim(s string) string {
+	return strings.TrimSpace(s)
 }

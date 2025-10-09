@@ -3,15 +3,13 @@ package cloud_task_registry
 import (
 	"context"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"log"
 	"math/rand"
-	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 const finishedTasksQ = "finished-tasks"
@@ -64,12 +62,8 @@ func (registry *CloudTaskRegistry) WaitForPipelineFinish(
 	wasCancelled chan bool,
 ) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-sigs
-		wasCancelled <- true
+		<-wasCancelled
 		cancel()
 	}()
 	defer func() {
@@ -182,4 +176,74 @@ func makeMessageMaximallyVisible(queueName, receiptHandle string, svc *sqs.Clien
 		return fmt.Errorf("failed to change message visibility: %w", err)
 	}
 	return nil
+}
+
+func (registry *CloudTaskRegistry) WaitForDLQ(
+	dlqName string,
+	expectedTaskRunUUID string,
+	wasCancelled chan bool,
+) (string, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-wasCancelled
+		cancel()
+	}()
+	defer func() {
+		wasCancelled <- false
+	}()
+
+	queueURL, err := getQueueUrl(dlqName, registry.sqsClient)
+	if err != nil {
+		return "", fmt.Errorf("error getting SQS queue URL for name %q, %w", finishedTasksQ, err)
+	}
+	log.Println("Waiting for the dead-letter queue...")
+	for {
+		// Receive messages with long polling
+		output, err := registry.sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+			QueueUrl:            aws.String(queueURL),
+			MaxNumberOfMessages: 1,
+			WaitTimeSeconds:     longPollingInterval,
+		})
+		if err != nil {
+			return "", fmt.Errorf("failed to receive messages, %w", err)
+		}
+
+		if len(output.Messages) == 0 {
+			continue
+		}
+
+		log.Printf("Received a message from the dead-letter queue %s\n", dlqName)
+		if len(output.Messages) > 1 {
+			log.Println("Received message count is more than 1! Only the first will be taken.")
+		}
+
+		failedTaskRunUUID := output.Messages[0].Body
+		if *failedTaskRunUUID != expectedTaskRunUUID {
+			log.Printf("DLQ returned %s as a failed task but expected %s, keep waiting...\n",
+				*failedTaskRunUUID, expectedTaskRunUUID)
+			err := makeMessageMaximallyVisible(dlqName, *output.Messages[0].ReceiptHandle, registry.sqsClient)
+			if err != nil {
+				log.Printf("Failed to set message visibility timeout to 0 due to an error: %v\n", err)
+				log.Println("You can try sending SIGSTOP and SIGCONT to one of the task runners " +
+					"to break the tie between them if this is the case.")
+			}
+			interrupted := SleepInterruptibly(ctx, time.Duration(rand.Intn(3000))*time.Millisecond)
+			if interrupted {
+				return expectedTaskRunUUID, nil
+			} else {
+				continue
+			}
+		} else {
+			log.Println("TaskRun", *failedTaskRunUUID, "failed!")
+			_, err = registry.sqsClient.DeleteMessage(context.TODO(), &sqs.DeleteMessageInput{
+				QueueUrl:      aws.String(queueURL),
+				ReceiptHandle: output.Messages[0].ReceiptHandle,
+			})
+			if err != nil {
+				fmt.Printf("failed to remove message from the queue (non-critical error), %w", err)
+			}
+		}
+
+		return *failedTaskRunUUID, nil
+	}
 }
