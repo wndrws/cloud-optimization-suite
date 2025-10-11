@@ -189,16 +189,7 @@ func main() {
 			log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Failed,
 				"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
 		}
-		results := finishedTask.Results
-		if results == nil {
-			results = make(map[string]string)
-		}
-		for _, obj := range objectives {
-			if _, ok := results[obj]; !ok {
-				results[obj] = "NaN"
-			}
-		}
-		err = printMapToFile(*outputFile, results)
+		err = printResultsToFile(*outputFile, objectives, finishedTask.Results)
 		if err != nil {
 			log.Fatalf("failed printing results into the output file: %v", err)
 		}
@@ -206,7 +197,7 @@ func main() {
 		os.Exit(0)
 	} else {
 		if allStagesHaveStatus(finishedStages, cloud_task_registry.StageStatus_Success) {
-			err = printMapToFile(*outputFile, finishedTask.Results)
+			err = printResultsToFile(*outputFile, objectives, finishedTask.Results)
 			if err != nil {
 				log.Fatalf("failed printing results into the output file: %v", err)
 			}
@@ -297,16 +288,21 @@ func convertUuidTime(t uuid.Time) time.Time {
 	return time.Unix(sec, nsec).UTC()
 }
 
-func printMapToFile(filename string, m map[string]string) error {
+func printResultsToFile(filename string, objectives []string, results map[string]string) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("failed to create file %q: %w", filename, err)
 	}
 	defer file.Close()
 
-	for key, value := range m {
-		fmt.Printf("%s %s\n", value, key)
-		_, err := fmt.Fprintf(file, "%s %s\n", value, key)
+	for _, obj := range objectives {
+		if value, ok := results[obj]; !ok {
+			fmt.Printf("%s %s\n", "NaN", obj)
+			_, err = fmt.Fprintf(file, "%s %s\n", "NaN", obj)
+		} else {
+			fmt.Printf("%s %s\n", value, obj)
+			_, err = fmt.Fprintf(file, "%s %s\n", value, obj)
+		}
 		if err != nil {
 			return fmt.Errorf("failed to write to file %q: %w", filename, err)
 		}
