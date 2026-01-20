@@ -18,7 +18,7 @@ func TestPrintResultsToFile_MustRespectUserDefinedObjectivesOrder_MustPutNaNsFor
 		objectives := []string{"a", "c", "b"}
 		results := map[string]string{"b": "123.7", "c": "456"}
 		// when
-		err := printResultsToFile(testFile, objectives, results)
+		err := printResultsToFile(testFile, objectives, results, "NaN")
 		if err != nil {
 			t.Errorf("Error printing results to file: %v", err)
 		}
@@ -29,6 +29,25 @@ func TestPrintResultsToFile_MustRespectUserDefinedObjectivesOrder_MustPutNaNsFor
 		}
 		assert.Equal(t, []string{"NaN a", "456 c", "123.7 b"}, actual)
 	}
+}
+
+func TestPrintResultsToFile_MustPutSpecifiedValueForAbsentObjectivesIfProvided(t *testing.T) {
+	// given
+	tmpDir := t.TempDir()
+	testFile := tmpDir + "/test"
+	objectives := []string{"a", "c", "b"}
+	results := map[string]string{"b": "123.7", "c": "NaN"}
+	// when
+	err := printResultsToFile(testFile, objectives, results, "-9999")
+	if err != nil {
+		t.Errorf("Error printing results to file: %v", err)
+	}
+	// then
+	actual, err := readTestFile(testFile)
+	if err != nil {
+		t.Errorf("Error reading test file: %v", err)
+	}
+	assert.Equal(t, []string{"-9999 a", "NaN c", "123.7 b"}, actual)
 }
 
 func readTestFile(filePath string) ([]string, error) {

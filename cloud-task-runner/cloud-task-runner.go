@@ -36,6 +36,8 @@ func main() {
 		flag.String("dlq-name", "DLQ", "Name of the Dead Letter Queue to monitor for failed tasks")
 	objectivesArg :=
 		flag.String("objectives", "", "Comma-separated list of required objectives names (e.g. 'obj1,obj2')")
+	missingObjectiveValue :=
+		flag.String("missing-obj-value", "NaN", "Value to put as objectives if they are not present in task results (e.g., due to task failure)")
 
 	flag.Parse()
 
@@ -147,7 +149,7 @@ func main() {
 
 	cancelled := <-wasCancelled
 	if cancelled {
-		log.Println("Task execution cancelled!")
+		log.Printf("%s (run %s): Task execution cancelled!\n", taskRun.TaskID, taskRun.UUID)
 		os.Exit(-1)
 	}
 
@@ -189,7 +191,7 @@ func main() {
 			log.Println("Failed setting status", cloud_task_registry.TaskRunStatus_Failed,
 				"to task run", taskRun.UUID, "of task", taskRun.TaskID, "(non-critical error)", err)
 		}
-		err = printResultsToFile(*outputFile, objectives, finishedTask.Results)
+		err = printResultsToFile(*outputFile, objectives, finishedTask.Results, *missingObjectiveValue)
 		if err != nil {
 			log.Fatalf("failed printing results into the output file: %v", err)
 		}
@@ -197,7 +199,7 @@ func main() {
 		os.Exit(0)
 	} else {
 		if allStagesHaveStatus(finishedStages, cloud_task_registry.StageStatus_Success) {
-			err = printResultsToFile(*outputFile, objectives, finishedTask.Results)
+			err = printResultsToFile(*outputFile, objectives, finishedTask.Results, *missingObjectiveValue)
 			if err != nil {
 				log.Fatalf("failed printing results into the output file: %v", err)
 			}
@@ -288,7 +290,7 @@ func convertUuidTime(t uuid.Time) time.Time {
 	return time.Unix(sec, nsec).UTC()
 }
 
-func printResultsToFile(filename string, objectives []string, results map[string]string) error {
+func printResultsToFile(filename string, objectives []string, results map[string]string, missingObjValue string) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("failed to create file %q: %w", filename, err)
@@ -297,8 +299,8 @@ func printResultsToFile(filename string, objectives []string, results map[string
 
 	for _, obj := range objectives {
 		if value, ok := results[obj]; !ok {
-			fmt.Printf("%s %s\n", "NaN", obj)
-			_, err = fmt.Fprintf(file, "%s %s\n", "NaN", obj)
+			fmt.Printf("%s %s\n", missingObjValue, obj)
+			_, err = fmt.Fprintf(file, "%s %s\n", missingObjValue, obj)
 		} else {
 			fmt.Printf("%s %s\n", value, obj)
 			_, err = fmt.Fprintf(file, "%s %s\n", value, obj)
